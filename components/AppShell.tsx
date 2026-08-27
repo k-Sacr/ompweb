@@ -139,8 +139,8 @@ function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsa
       return;
     }
     const controller = new AbortController();
+    setState({ snapshot: null, loading: true, error: false });
     const load = async () => {
-      setState({ snapshot: null, loading: true, error: false });
       try {
         const response = await fetch(`/api/provider-usage${query ? `?${query}` : ""}`, { signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
