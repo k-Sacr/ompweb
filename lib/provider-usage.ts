@@ -17,8 +17,8 @@ type UsageQuery = { provider?: string; modelId?: string };
 
 type CachedUsage = { expiresAt: number; output: string };
 
-const usageCache = new Map<string, CachedUsage>();
-const usageInFlight = new Map<string, Promise<string>>();
+let usageCache: CachedUsage | undefined;
+let usageInFlight: Promise<string> | undefined;
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -59,11 +59,13 @@ function accountLabel(metadata: Record<string, unknown> | undefined): string | u
   return nonEmptyString(metadata?.email) ?? nonEmptyString(metadata?.accountId);
 }
 
+type UsageLimit = { id: ProviderUsageWindowId; fraction: number; window: Record<string, unknown> };
+
 type UsageGroup = {
   priority: number;
   modelId?: string;
   tier?: string;
-  limits: Array<{ id: ProviderUsageWindowId; fraction: number; window: Record<string, unknown> }>;
+  limits: Map<ProviderUsageWindowId, UsageLimit>;
 };
 
 function normalizeReport(
@@ -94,10 +96,14 @@ function normalizeReport(
     const normalizedTier = tier?.toLowerCase();
     const groupKey = `${normalizedModelId ?? ""}\0${normalizedTier ?? ""}`;
     const priority = modelId ? (normalizedTier ? 1 : 0) : normalizedTier ? 3 : 2;
-    const group = groups.get(groupKey);
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = { priority, modelId, tier, limits: new Map() };
+      groups.set(groupKey, group);
+    }
     const candidate = { id: windowId, fraction, window };
-    if (group) group.limits.push(candidate);
-    else groups.set(groupKey, { priority, modelId, tier, limits: [candidate] });
+    const current = group.limits.get(windowId);
+    if (!current || fraction > current.fraction) group.limits.set(windowId, candidate);
   }
 
   const selectedGroups = [...groups.values()];
@@ -126,7 +132,7 @@ function normalizeReport(
       ...(group.modelId ? { modelId: group.modelId } : {}),
       ...(group.tier ? { tier: group.tier } : {}),
     };
-    for (const candidate of group.limits) {
+    for (const candidate of group.limits.values()) {
       const normalized = usageWindow(candidate.id, candidate.fraction, candidate.window, now);
       if (candidate.id === "5h" && !result.fiveHour) result.fiveHour = normalized;
       if (candidate.id === "7d" && !result.sevenDay) result.sevenDay = normalized;
@@ -150,12 +156,10 @@ export function parseProviderUsageOutput(output: string, query: UsageQuery = {},
   return { generatedAt, reports };
 }
 
-async function fetchProviderUsage(provider?: string): Promise<string> {
+async function fetchProviderUsage(): Promise<string> {
   const bin = resolveOmpBin();
   if (!bin) throw new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN.");
-  const args = ["usage", "--json", "--redact"];
-  if (provider) args.push("--provider", provider);
-  const { stdout } = await execFileAsync(bin, args, {
+  const { stdout } = await execFileAsync(bin, ["usage", "--json", "--redact"], {
     timeout: USAGE_TIMEOUT_MS,
     maxBuffer: USAGE_MAX_BUFFER,
     windowsHide: true,
@@ -163,26 +167,22 @@ async function fetchProviderUsage(provider?: string): Promise<string> {
   return stdout;
 }
 
-function getUsageOutput(provider?: string): Promise<string> {
-  const key = provider ?? "";
-  const cached = usageCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.output);
-  const running = usageInFlight.get(key);
-  if (running) return running;
-  const request = fetchProviderUsage(provider)
+function getUsageOutput(): Promise<string> {
+  if (usageCache && usageCache.expiresAt > Date.now()) return Promise.resolve(usageCache.output);
+  if (usageInFlight) return usageInFlight;
+  usageInFlight = fetchProviderUsage()
     .then((output) => {
-      usageCache.set(key, { output, expiresAt: Date.now() + USAGE_CACHE_TTL_MS });
+      usageCache = { output, expiresAt: Date.now() + USAGE_CACHE_TTL_MS };
       return output;
     })
-    .finally(() => usageInFlight.delete(key));
-  usageInFlight.set(key, request);
-  return request;
+    .finally(() => { usageInFlight = undefined; });
+  return usageInFlight;
 }
 
 export async function getProviderUsage(query: UsageQuery = {}): Promise<ProviderUsageSnapshot> {
-  return parseProviderUsageOutput(await getUsageOutput(query.provider), query);
+  return parseProviderUsageOutput(await getUsageOutput(), query);
 }
 
 export function clearProviderUsageCache(): void {
-  usageCache.clear();
+  usageCache = undefined;
 }
