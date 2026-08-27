@@ -14,10 +14,11 @@ const USAGE_MAX_BUFFER = 4 * 1024 * 1024;
 const USAGE_CACHE_TTL_MS = 5 * 60_000;
 
 type UsageQuery = { provider?: string; modelId?: string };
-type CachedUsage = { expiresAt: number; snapshot: ProviderUsageSnapshot };
+
+type CachedUsage = { expiresAt: number; output: string };
 
 const usageCache = new Map<string, CachedUsage>();
-const usageInFlight = new Map<string, Promise<ProviderUsageSnapshot>>();
+const usageInFlight = new Map<string, Promise<string>>();
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -149,39 +150,37 @@ export function parseProviderUsageOutput(output: string, query: UsageQuery = {},
   return { generatedAt, reports };
 }
 
-function usageCacheKey(query: UsageQuery): string {
-  return `${query.provider ?? ""}\0${query.modelId ?? ""}`;
-}
-
-async function fetchProviderUsage(query: UsageQuery): Promise<ProviderUsageSnapshot> {
+async function fetchProviderUsage(provider?: string): Promise<string> {
   const bin = resolveOmpBin();
   if (!bin) throw new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN.");
   const args = ["usage", "--json", "--redact"];
-  if (query.provider) args.push("--provider", query.provider);
+  if (provider) args.push("--provider", provider);
   const { stdout } = await execFileAsync(bin, args, {
     timeout: USAGE_TIMEOUT_MS,
     maxBuffer: USAGE_MAX_BUFFER,
-    env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
     windowsHide: true,
   });
-  return parseProviderUsageOutput(stdout, query);
+  return stdout;
 }
 
-export function getProviderUsage(query: UsageQuery = {}): Promise<ProviderUsageSnapshot> {
-  const key = usageCacheKey(query);
-  const now = Date.now();
+function getUsageOutput(provider?: string): Promise<string> {
+  const key = provider ?? "";
   const cached = usageCache.get(key);
-  if (cached && cached.expiresAt > now) return Promise.resolve(cached.snapshot);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.output);
   const running = usageInFlight.get(key);
   if (running) return running;
-  const request = fetchProviderUsage(query)
-    .then((snapshot) => {
-      usageCache.set(key, { snapshot, expiresAt: Date.now() + USAGE_CACHE_TTL_MS });
-      return snapshot;
+  const request = fetchProviderUsage(provider)
+    .then((output) => {
+      usageCache.set(key, { output, expiresAt: Date.now() + USAGE_CACHE_TTL_MS });
+      return output;
     })
     .finally(() => usageInFlight.delete(key));
   usageInFlight.set(key, request);
   return request;
+}
+
+export async function getProviderUsage(query: UsageQuery = {}): Promise<ProviderUsageSnapshot> {
+  return parseProviderUsageOutput(await getUsageOutput(query.provider), query);
 }
 
 export function clearProviderUsageCache(): void {

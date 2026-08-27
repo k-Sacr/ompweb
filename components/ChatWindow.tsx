@@ -469,17 +469,14 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
   const modelCapacityRef = useRef(modelCapacity);
   modelCapacityRef.current = modelCapacity;
   useEffect(() => { onModelCapacityChange?.(modelCapacityRef.current); }, [modelCapacityKey, onModelCapacityChange]);
-  const providerUsageContext = displayModelValue ? {
-    provider: displayModelValue.provider,
-    modelId: displayModelValue.modelId,
-  } : null;
-  const providerUsageContextKey = providerUsageContext ? `${providerUsageContext.provider}|${providerUsageContext.modelId}` : "";
-  const providerUsageContextRef = useRef(providerUsageContext);
-  providerUsageContextRef.current = providerUsageContext;
+  const providerUsageContext = useMemo<ProviderUsageContext | null>(
+    () => displayModelValue ? { provider: displayModelValue.provider, modelId: displayModelValue.modelId } : null,
+    [displayModelValue?.provider, displayModelValue?.modelId],
+  );
   useEffect(() => {
-    onProviderUsageContextChange?.(providerUsageContextRef.current);
+    onProviderUsageContextChange?.(providerUsageContext);
     return () => onProviderUsageContextChange?.(null);
-  }, [providerUsageContextKey, onProviderUsageContextChange]);
+  }, [onProviderUsageContextChange, providerUsageContext]);
   const hasCompaction = messages.some((message) => message.role === "custom" && (message as CustomMessage).customType === "compaction");
   const [generationSpeed, setGenerationSpeed] = useState<GenerationSpeedInfo | null>(null);
   const speedSamplesRef = useRef<number[]>([]);

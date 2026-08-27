@@ -125,6 +125,41 @@ function formatProviderUsageReport(report: ProviderUsageReport, noLimitsLabel: s
   }
   return parts.join(" · ");
 }
+type ProviderUsageState = {
+  snapshot: ProviderUsageSnapshot | null;
+  loading: boolean;
+  error: boolean;
+};
+
+function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsageState {
+  const [state, setState] = useState<ProviderUsageState>({ snapshot: null, loading: false, error: false });
+  useEffect(() => {
+    if (query === null) {
+      setState({ snapshot: null, loading: false, error: false });
+      return;
+    }
+    const controller = new AbortController();
+    const load = async () => {
+      setState({ snapshot: null, loading: true, error: false });
+      try {
+        const response = await fetch(`/api/provider-usage${query ? `?${query}` : ""}`, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const snapshot = await response.json() as ProviderUsageSnapshot;
+        if (!controller.signal.aborted) setState({ snapshot, loading: false, error: false });
+      } catch {
+        if (!controller.signal.aborted) setState({ snapshot: null, loading: false, error: true });
+      }
+    };
+    void load();
+    const interval = refreshMs ? window.setInterval(() => void load(), refreshMs) : undefined;
+    return () => {
+      controller.abort();
+      if (interval !== undefined) window.clearInterval(interval);
+    };
+  }, [query, refreshMs]);
+  return state;
+}
+
 
 export function AppShell() {
   const router = useRouter();
@@ -352,54 +387,17 @@ export function AppShell() {
   }, []);
 
   const [providerUsageContext, setProviderUsageContext] = useState<ProviderUsageContext | null>(null);
-  const [providerUsage, setProviderUsage] = useState<ProviderUsageSnapshot | null>(null);
-  const [providerUsageLoading, setProviderUsageLoading] = useState(false);
-  const [providerUsageError, setProviderUsageError] = useState(false);
   const handleProviderUsageContextChange = useCallback((context: ProviderUsageContext | null) => {
     setProviderUsageContext(context);
   }, []);
   const activeProvider = providerUsageContext?.provider ?? null;
   const activeModelId = providerUsageContext?.modelId ?? null;
+  const providerUsageQuery = providerUsageVisible && activeProvider
+    ? new URLSearchParams({ provider: activeProvider, ...(activeModelId ? { model: activeModelId } : {}) }).toString()
+    : null;
+  const { snapshot: providerUsage, loading: providerUsageLoading, error: providerUsageError } =
+    useProviderUsage(providerUsageQuery, 5 * 60_000);
 
-  useEffect(() => {
-    if (!providerUsageVisible || !activeProvider) {
-      setProviderUsage(null);
-      setProviderUsageLoading(false);
-      setProviderUsageError(false);
-      return;
-    }
-    const controller = new AbortController();
-    let mounted = true;
-    const load = async () => {
-      setProviderUsageLoading(true);
-      try {
-        const params = new URLSearchParams({ provider: activeProvider });
-        if (activeModelId) params.set("model", activeModelId);
-        const response = await fetch(`/api/provider-usage?${params}`, { signal: controller.signal });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const snapshot = await response.json() as ProviderUsageSnapshot;
-        if (!mounted) return;
-        setProviderUsage(snapshot);
-        setProviderUsageError(false);
-      } catch (error) {
-        if (!mounted || (error instanceof DOMException && error.name === "AbortError")) return;
-        setProviderUsageError(true);
-      } finally {
-        if (mounted) setProviderUsageLoading(false);
-      }
-    };
-    void load();
-    const interval = window.setInterval(() => void load(), 5 * 60_000);
-    return () => {
-      mounted = false;
-      controller.abort();
-      window.clearInterval(interval);
-    };
-  }, [activeModelId, activeProvider, providerUsageVisible]);
-
-  const [allProviderUsage, setAllProviderUsage] = useState<ProviderUsageSnapshot | null>(null);
-  const [allProviderUsageLoading, setAllProviderUsageLoading] = useState(false);
-  const [allProviderUsageError, setAllProviderUsageError] = useState(false);
 
   useEffect(() => {
     return () => {
@@ -425,32 +423,8 @@ export function AppShell() {
     if (isMobile) setSidebarOpen(false);
     setActiveTopPanel((cur) => cur === panel ? null : panel);
   }, [isMobile]);
-  useEffect(() => {
-    if (activeTopPanel !== "usage") return;
-    const controller = new AbortController();
-    let mounted = true;
-    const load = async () => {
-      setAllProviderUsageLoading(true);
-      try {
-        const response = await fetch("/api/provider-usage", { signal: controller.signal });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const snapshot = await response.json() as ProviderUsageSnapshot;
-        if (!mounted) return;
-        setAllProviderUsage(snapshot);
-        setAllProviderUsageError(false);
-      } catch (error) {
-        if (!mounted || (error instanceof DOMException && error.name === "AbortError")) return;
-        setAllProviderUsageError(true);
-      } finally {
-        if (mounted) setAllProviderUsageLoading(false);
-      }
-    };
-    void load();
-    return () => {
-      mounted = false;
-      controller.abort();
-    };
-  }, [activeTopPanel]);
+  const { snapshot: allProviderUsage, loading: allProviderUsageLoading, error: allProviderUsageError } =
+    useProviderUsage(activeTopPanel === "usage" ? "" : null, 5 * 60_000);
 
   useEffect(() => {
     if (!providerUsageVisible && activeTopPanel === "usage") setActiveTopPanel(null);
