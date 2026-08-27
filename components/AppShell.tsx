@@ -11,7 +11,7 @@ import { ChatWindow } from "./ChatWindow";
 import { TabBar, type Tab } from "./TabBar";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
-import { Check, CircleCheck, History, Menu, Moon, PanelLeft, Sun, Terminal, Wand2 } from "lucide-react";
+import { Check, CircleCheck, Gauge, History, Menu, Moon, PanelLeft, Sun, Terminal, Wand2 } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import { formatCompactNumber, formatPercent, getCacheHitRate } from "@/lib/format";
 import { translate, useI18n } from "@/lib/i18n";
@@ -26,6 +26,7 @@ import { showCompletionNotification } from "@/lib/browser-notifications";
 import type { SessionInfo, SessionTreeNode } from "@/lib/types";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo, GenerationSpeedInfo } from "@/lib/pi-types";
+import type { ProviderUsageContext, ProviderUsageReport, ProviderUsageSnapshot } from "@/lib/provider-usage-types";
 import type { SettingsTab } from "./SettingsTabs";
 import { SettingsConfig } from "./SettingsConfig";
 import { ArchiveBrowser } from "./ArchiveBrowser";
@@ -40,6 +41,7 @@ const FileViewer = dynamic(() => import("./FileViewer").then((m) => m.FileViewer
 // --sidebar-width CSS variable (globals.css) and persisted between sessions.
 const SIDEBAR_WIDTH_STORAGE_KEY = "omp-web:sidebar-width";
 const TOOL_CALLS_COLLAPSED_STORAGE_KEY = "omp-web:tool-calls-collapsed";
+const PROVIDER_USAGE_VISIBLE_STORAGE_KEY = "omp-web:provider-usage-visible";
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 520;
 const SIDEBAR_DEFAULT_WIDTH = 260;
@@ -78,6 +80,51 @@ type AutoNameStatus =
   | { kind: "naming" }
   | { kind: "success" }
   | { kind: "error"; message: string };
+type TimerHandle = NodeJS.Timeout;
+
+function formatUsageReset(value: number, unit: "minutes" | "hours"): string {
+  if (unit === "minutes") {
+    if (value < 60) return `${value}m`;
+    const hours = Math.floor(value / 60);
+    const minutes = value % 60;
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  if (value < 24) return `${value}h`;
+  const days = Math.floor(value / 24);
+  const hours = value % 24;
+  return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+}
+
+function usageTone(percent: number): string {
+  if (percent >= 80) return "var(--status-error)";
+  if (percent >= 50) return "var(--status-warning)";
+  return "var(--text-muted)";
+}
+
+function formatProviderUsageReport(report: ProviderUsageReport, noLimitsLabel: string): string {
+  if (report.noLimits) return noLimitsLabel;
+  const parts: string[] = [];
+  if (report.tier) parts.push(report.tier);
+  if (report.fiveHour) {
+    const reset = report.fiveHour.resetMinutes === undefined
+      ? ""
+      : ` (${formatUsageReset(report.fiveHour.resetMinutes, "minutes")})`;
+    parts.push(`5h ${Math.round(report.fiveHour.percent)}%${reset}`);
+  }
+  if (report.sevenDay) {
+    const reset = report.sevenDay.resetHours === undefined
+      ? ""
+      : ` (${formatUsageReset(report.sevenDay.resetHours, "hours")})`;
+    parts.push(`7d ${Math.round(report.sevenDay.percent)}%${reset}`);
+  }
+  if (report.monthly) {
+    const reset = report.monthly.resetHours === undefined
+      ? ""
+      : ` (${formatUsageReset(report.monthly.resetHours, "hours")})`;
+    parts.push(`mo ${Math.floor(report.monthly.percent)}%${reset}`);
+  }
+  return parts.join(" · ");
+}
 
 export function AppShell() {
   const router = useRouter();
@@ -104,6 +151,7 @@ export function AppShell() {
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(SIDEBAR_DEFAULT_WIDTH);
   const [toolCallsDefaultCollapsed, setToolCallsDefaultCollapsed] = useState(true);
+  const [providerUsageVisible, setProviderUsageVisible] = useState(true);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   // Active drag handlers so an unmount mid-drag can detach them.
   const sidebarResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
@@ -114,6 +162,7 @@ export function AppShell() {
     setSidebarWidth(loadSidebarWidth());
     try {
       setToolCallsDefaultCollapsed(window.localStorage.getItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY) !== "false");
+      setProviderUsageVisible(window.localStorage.getItem(PROVIDER_USAGE_VISIBLE_STORAGE_KEY) !== "false");
     } catch {
       // Keep the compact default when storage is unavailable.
     }
@@ -122,6 +171,14 @@ export function AppShell() {
     setToolCallsDefaultCollapsed(collapsed);
     try {
       window.localStorage.setItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY, String(collapsed));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleProviderUsageVisibleChange = useCallback((visible: boolean) => {
+    setProviderUsageVisible(visible);
+    try {
+      window.localStorage.setItem(PROVIDER_USAGE_VISIBLE_STORAGE_KEY, String(visible));
     } catch {
       // The preference still applies for this page load.
     }
@@ -261,6 +318,7 @@ export function AppShell() {
   const systemPromptLoaderRef = useRef<(() => Promise<void>) | null>(null);
   const systemPromptLoadIdRef = useRef(0);
   const systemBtnRef = useRef<HTMLButtonElement>(null);
+  const usageBtnRef = useRef<HTMLButtonElement>(null);
   const sessionStatsBtnRef = useRef<HTMLButtonElement>(null);
 
   const handleSystemPromptChange = useCallback((prompt: string | null) => {
@@ -277,26 +335,76 @@ export function AppShell() {
   // Session stats (tokens + cost) — populated by ChatWindow, displayed in top bar
   const [sessionStats, setSessionStats] = useState<SessionStatsInfo | null>(null);
   const [autoNameStatus, setAutoNameStatus] = useState<AutoNameStatus>({ kind: "idle" });
-  const autoNameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoNameTimerRef = useRef<TimerHandle | undefined>(undefined);
   const activeSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
   activeSessionIdRef.current = selectedSession?.id ?? null;
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
     setSessionStats(stats);
   }, []);
   const [copiedSessionField, setCopiedSessionField] = useState<SessionCopyField | null>(null);
-  const sessionCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionCopyTimerRef = useRef<TimerHandle | undefined>(undefined);
   const handleCopySessionField = useCallback((field: SessionCopyField, value: string) => {
     void copyText(value).then(() => {
-      if (sessionCopyTimerRef.current) clearTimeout(sessionCopyTimerRef.current);
+      clearTimeout(sessionCopyTimerRef.current);
       setCopiedSessionField(field);
       sessionCopyTimerRef.current = setTimeout(() => setCopiedSessionField(null), 1400);
     });
   }, []);
 
+  const [providerUsageContext, setProviderUsageContext] = useState<ProviderUsageContext | null>(null);
+  const [providerUsage, setProviderUsage] = useState<ProviderUsageSnapshot | null>(null);
+  const [providerUsageLoading, setProviderUsageLoading] = useState(false);
+  const [providerUsageError, setProviderUsageError] = useState(false);
+  const handleProviderUsageContextChange = useCallback((context: ProviderUsageContext | null) => {
+    setProviderUsageContext(context);
+  }, []);
+  const activeProvider = providerUsageContext?.provider ?? null;
+  const activeModelId = providerUsageContext?.modelId ?? null;
+
+  useEffect(() => {
+    if (!providerUsageVisible || !activeProvider) {
+      setProviderUsage(null);
+      setProviderUsageLoading(false);
+      setProviderUsageError(false);
+      return;
+    }
+    const controller = new AbortController();
+    let mounted = true;
+    const load = async () => {
+      setProviderUsageLoading(true);
+      try {
+        const params = new URLSearchParams({ provider: activeProvider });
+        if (activeModelId) params.set("model", activeModelId);
+        const response = await fetch(`/api/provider-usage?${params}`, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const snapshot = await response.json() as ProviderUsageSnapshot;
+        if (!mounted) return;
+        setProviderUsage(snapshot);
+        setProviderUsageError(false);
+      } catch (error) {
+        if (!mounted || (error instanceof DOMException && error.name === "AbortError")) return;
+        setProviderUsageError(true);
+      } finally {
+        if (mounted) setProviderUsageLoading(false);
+      }
+    };
+    void load();
+    const interval = window.setInterval(() => void load(), 5 * 60_000);
+    return () => {
+      mounted = false;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [activeModelId, activeProvider, providerUsageVisible]);
+
+  const [allProviderUsage, setAllProviderUsage] = useState<ProviderUsageSnapshot | null>(null);
+  const [allProviderUsageLoading, setAllProviderUsageLoading] = useState(false);
+  const [allProviderUsageError, setAllProviderUsageError] = useState(false);
+
   useEffect(() => {
     return () => {
-      if (sessionCopyTimerRef.current) clearTimeout(sessionCopyTimerRef.current);
-      if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
+      clearTimeout(sessionCopyTimerRef.current);
+      clearTimeout(autoNameTimerRef.current);
     };
   }, []);
 
@@ -311,12 +419,42 @@ export function AppShell() {
   }, []);
 
   // Single active panel — only one dropdown open at a time
-  const [activeTopPanel, setActiveTopPanel] = useState<"branches" | "system" | "session" | null>(null);
-  const [topPanelPos, setTopPanelPos] = useState<{ top: number; left: number; width: number } | null>(null);
-  const toggleTopPanel = useCallback((panel: "branches" | "system" | "session") => {
+  const [activeTopPanel, setActiveTopPanel] = useState<"branches" | "system" | "usage" | "session" | null>(null);
+  const [topPanelPos, setTopPanelPos] = useState<{ top: number; left: number; right: number; width: number } | null>(null);
+  const toggleTopPanel = useCallback((panel: "branches" | "system" | "usage" | "session") => {
     if (isMobile) setSidebarOpen(false);
     setActiveTopPanel((cur) => cur === panel ? null : panel);
   }, [isMobile]);
+  useEffect(() => {
+    if (activeTopPanel !== "usage") return;
+    const controller = new AbortController();
+    let mounted = true;
+    const load = async () => {
+      setAllProviderUsageLoading(true);
+      try {
+        const response = await fetch("/api/provider-usage", { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const snapshot = await response.json() as ProviderUsageSnapshot;
+        if (!mounted) return;
+        setAllProviderUsage(snapshot);
+        setAllProviderUsageError(false);
+      } catch (error) {
+        if (!mounted || (error instanceof DOMException && error.name === "AbortError")) return;
+        setAllProviderUsageError(true);
+      } finally {
+        if (mounted) setAllProviderUsageLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      mounted = false;
+      controller.abort();
+    };
+  }, [activeTopPanel]);
+
+  useEffect(() => {
+    if (!providerUsageVisible && activeTopPanel === "usage") setActiveTopPanel(null);
+  }, [activeTopPanel, providerUsageVisible]);
 
   // Generation speed — current live t/s and the session average.
   const [generationSpeed, setGenerationSpeed] = useState<GenerationSpeedInfo | null>(null);
@@ -415,27 +553,34 @@ export function AppShell() {
   }, []);
 
   useEffect(() => {
-    if (!activeTopPanel || !topBarRef.current) return;
+    if (!activeTopPanel) return;
+    const anchor = activeTopPanel === "usage" ? usageBtnRef.current : topBarRef.current;
+    if (!anchor) return;
     const update = () => {
-      const rect = topBarRef.current!.getBoundingClientRect();
-      setTopPanelPos({ top: rect.bottom, left: rect.left, width: rect.width });
+      const rect = anchor.getBoundingClientRect();
+      setTopPanelPos({
+        top: rect.bottom,
+        left: rect.left,
+        right: window.innerWidth - rect.right,
+        width: rect.width,
+      });
     };
     update();
     const ro = new ResizeObserver(update);
-    ro.observe(topBarRef.current);
+    ro.observe(anchor);
     return () => ro.disconnect();
   }, [activeTopPanel]);
 
-  // Dismiss the system/session dropdowns on outside click or Escape. The
-  // Escape handler stops propagation so the global Esc (abort agent) does not
-  // fire while a panel is open; clicks on the trigger buttons themselves are
-  // ignored here — their onClick toggles the panel.
+  // Dismiss the topbar dropdowns on outside click or Escape. The Escape
+  // handler stops propagation so the global Esc (abort agent) does not fire
+  // while a panel is open.
   useEffect(() => {
     // The branch panel manages its own outside-click and Escape dismissal.
     if (!activeTopPanel || activeTopPanel === "branches") return;
     const onPointerDown = (event: MouseEvent) => {
       if (event.target instanceof Element && event.target.closest("[data-top-panel]")) return;
       if (systemBtnRef.current?.contains(event.target as Node)) return;
+      if (usageBtnRef.current?.contains(event.target as Node)) return;
       if (sessionStatsBtnRef.current?.contains(event.target as Node)) return;
       setActiveTopPanel(null);
     };
@@ -638,7 +783,7 @@ export function AppShell() {
   const handleAutoName = useCallback(async () => {
     const sessionId = selectedSession?.id;
     if (!sessionId || autoNameStatus.kind === "naming") return;
-    if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
+    clearTimeout(autoNameTimerRef.current);
     setActiveTopPanel(null);
     setAutoNameStatus({ kind: "naming" });
 
@@ -667,7 +812,7 @@ export function AppShell() {
   }, [autoNameStatus.kind, selectedSession?.id]);
 
   useEffect(() => {
-    if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
+    clearTimeout(autoNameTimerRef.current);
     setAutoNameStatus({ kind: "idle" });
   }, [selectedSession?.id]);
 
@@ -833,6 +978,19 @@ export function AppShell() {
       />
     </>
   );
+
+  const currentProviderUsageReport = providerUsage?.reports[0] ?? null;
+  const currentProviderUsageText = currentProviderUsageReport
+    ? formatProviderUsageReport(currentProviderUsageReport, t("appShell.providerUsageNoData"))
+    : null;
+  const currentProviderUsagePercents = currentProviderUsageReport ? [
+    currentProviderUsageReport.fiveHour?.percent,
+    currentProviderUsageReport.sevenDay?.percent,
+    currentProviderUsageReport.monthly?.percent,
+  ].filter((percent): percent is number => percent !== undefined) : [];
+  const currentProviderUsageColor = currentProviderUsagePercents.length > 0
+    ? usageTone(Math.max(...currentProviderUsagePercents))
+    : "var(--text-muted)";
 
   return (
     <>
@@ -1073,6 +1231,45 @@ export function AppShell() {
             </div>
           </>
         )}
+          <div data-topbar-right-group style={{ marginLeft: "auto", display: "flex", alignItems: "center", height: "100%" }}>
+          {showChat && providerUsageVisible && (providerUsage || providerUsageLoading || providerUsageError) && (
+            <button
+              ref={usageBtnRef}
+              type="button"
+              data-provider-usage-trigger
+              onClick={() => toggleTopPanel("usage")}
+              title={currentProviderUsageText
+                ? t("appShell.tooltipProviderUsage", { value: currentProviderUsageText })
+                : providerUsageLoading
+                  ? t("appShell.providerUsageLoading")
+                  : providerUsageError
+                    ? t("appShell.providerUsageUnavailable")
+                    : t("appShell.providerUsageNoData")}
+              aria-label={t("appShell.providerUsageButton")}
+              aria-pressed={activeTopPanel === "usage"}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                padding: isMobile ? "0 8px" : "0 10px",
+                height: "100%",
+                color: currentProviderUsageText ? currentProviderUsageColor : "var(--text-muted)",
+                background: activeTopPanel === "usage" ? "var(--bg-selected)" : "none",
+                border: "none",
+                fontSize: 11,
+                whiteSpace: "nowrap",
+                cursor: "pointer",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              <Gauge size={14} strokeWidth={1.8} aria-hidden="true" />
+              {!isMobile && (currentProviderUsageText ?? (providerUsageLoading
+                ? t("appShell.providerUsageLoading")
+                : providerUsageError
+                  ? t("appShell.providerUsageUnavailable")
+                  : t("appShell.providerUsageNoData")))}
+            </button>
+          )}
           {/* Session stats and generation speed — right-aligned in top bar */}
           {showChat && (sessionStats || contextUsage || modelCapacity || generationSpeed) && (() => {
             const tok = sessionStats?.tokens;
@@ -1126,8 +1323,7 @@ export function AppShell() {
                 aria-label={t("appShell.sessionInfo")}
                 aria-pressed={activeTopPanel === "session"}
                 style={{
-                  marginLeft: "auto",
-                  display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+                  marginLeft: "auto", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
                   paddingLeft: isMobile ? 0 : 12,
                   // Reserve the corner for the always-visible file-panel
                   // toggle: on mobile it is 44px wide and would otherwise
@@ -1216,16 +1412,16 @@ export function AppShell() {
               </button>
             );
           })()}
+          </div>
           {/* Top panel dropdown — shared, only one active at a time. The
               branch panel renders inside BranchNavigator itself; never mount
               an empty fixed layer for it (it would sit over the top-bar
               region and swallow clicks). */}
-          {(activeTopPanel === "system" || activeTopPanel === "session") && topPanelPos && (
+          {(activeTopPanel === "system" || activeTopPanel === "usage" || activeTopPanel === "session") && topPanelPos && (
             <div data-top-panel className="dropdown-surface" style={{
               position: "fixed",
               top: topPanelPos.top,
-              // Right-aligned, width auto based on content — prevents cut-off and lets the window resize with its content
-              right: 12,
+              right: activeTopPanel === "usage" ? topPanelPos.right : 12,
               left: "auto",
               width: "auto",
               minWidth: 360,
@@ -1235,6 +1431,57 @@ export function AppShell() {
               overflowX: "hidden",
               zIndex: 500,
             }}>
+              {activeTopPanel === "usage" && (
+                <div className="session-info-popover" style={{
+                  background: "var(--bg-panel)",
+                  borderBottom: "1px solid var(--border)",
+                  boxShadow: "var(--shadow-pop)",
+                  padding: "12px 16px",
+                  minWidth: isMobile ? undefined : 520,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 10 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text)" }}>{t("appShell.sectionProviderUsage")}</div>
+                    {allProviderUsageLoading && allProviderUsage && (
+                      <span style={{ fontSize: 11, color: "var(--text-dim)" }}>{t("appShell.providerUsageLoading")}</span>
+                    )}
+                  </div>
+                  {allProviderUsage?.reports.length ? (
+                    <div style={{ display: "grid", gap: 8, fontSize: 12, lineHeight: 1.5, fontFamily: "var(--font-mono)" }}>
+                      {allProviderUsage.reports.map((report, index) => {
+                        const account = report.accountLabel ?? t("appShell.account", { number: report.accountIndex ?? index + 1 });
+                        const scope = [
+                          report.provider,
+                          account,
+                          report.modelId ?? t("appShell.allModels"),
+                          report.tier ? `tier: ${report.tier}` : null,
+                          report.plan ? `plan: ${report.plan}` : null,
+                        ].filter(Boolean).join(" · ");
+                        const percents = [
+                          report.fiveHour?.percent,
+                          report.sevenDay?.percent,
+                          report.monthly?.percent,
+                        ].filter((percent): percent is number => percent !== undefined);
+                        return (
+                          <div key={`${scope}:${index}`} style={{ display: "grid", gridTemplateColumns: "minmax(190px, 1fr) auto", gap: 16, alignItems: "baseline" }}>
+                            <div style={{ color: "var(--text-dim)", overflowWrap: "anywhere" }}>{scope}</div>
+                            <div style={{ color: percents.length ? usageTone(Math.max(...percents)) : "var(--text-muted)", whiteSpace: "nowrap", textAlign: "right" }}>
+                              {formatProviderUsageReport(report, t("appShell.providerUsageNoData"))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : allProviderUsageLoading ? (
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>{t("appShell.providerUsageLoading")}</div>
+                  ) : allProviderUsageError ? (
+                    <div style={{ fontSize: 12, color: "var(--status-error)", fontStyle: "italic" }}>{t("appShell.providerUsageUnavailable")}</div>
+                  ) : allProviderUsage ? (
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>{t("appShell.providerUsageNoData")}</div>
+                  ) : (
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>{t("appShell.providerUsageLoading")}</div>
+                  )}
+                </div>
+              )}
               {activeTopPanel === "system" && (
                 <div style={{
                   background: "var(--bg-panel)",
@@ -1446,6 +1693,7 @@ export function AppShell() {
               onSystemPromptLoaderChange={handleSystemPromptLoaderChange}
               onSessionStatsChange={handleSessionStatsChange}
               onSessionStatsPanelOpen={openSessionStatsPanel}
+              onProviderUsageContextChange={handleProviderUsageContextChange}
               onContextUsageChange={handleContextUsageChange}
               onModelCapacityChange={handleModelCapacityChange}
               onGenerationSpeedChange={handleGenerationSpeedChange}
@@ -1577,7 +1825,7 @@ export function AppShell() {
         <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="15" y1="3" x2="15" y2="21" />
       </svg>
     </button>
-    {settingsTab && <SettingsConfig activeTab={settingsTab} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} onToolCallsDefaultCollapsedChange={handleToolCallsDefaultCollapsedChange} cwd={activeCwd ?? selectedSession?.cwd ?? newSessionCwd} sessionId={selectedSession?.id ?? null} onModelsSaved={() => setModelsRefreshKey((k) => k + 1)} onPluginsReloaded={() => setSessionKey((k) => k + 1)} onOmpUpdateAvailabilityChange={setOmpUpdateAvailable} onSelectTab={setSettingsTab} onClose={() => setSettingsTab(null)} />}
+    {settingsTab && <SettingsConfig activeTab={settingsTab} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} onToolCallsDefaultCollapsedChange={handleToolCallsDefaultCollapsedChange} providerUsageVisible={providerUsageVisible} onProviderUsageVisibleChange={handleProviderUsageVisibleChange} cwd={activeCwd ?? selectedSession?.cwd ?? newSessionCwd} sessionId={selectedSession?.id ?? null} onModelsSaved={() => setModelsRefreshKey((k) => k + 1)} onPluginsReloaded={() => setSessionKey((k) => k + 1)} onOmpUpdateAvailabilityChange={setOmpUpdateAvailable} onSelectTab={setSettingsTab} onClose={() => setSettingsTab(null)} />}
     {archiveBrowserOpen && (
       <ArchiveBrowser
         open={archiveBrowserOpen}
