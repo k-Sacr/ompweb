@@ -95,7 +95,7 @@ function normalizeReport(
     const normalizedModelId = modelId?.toLowerCase();
     const normalizedTier = tier?.toLowerCase();
     const groupKey = `${normalizedModelId ?? ""}\0${normalizedTier ?? ""}`;
-    const priority = modelId ? (normalizedTier ? 1 : 0) : normalizedTier ? 3 : 2;
+    const priority = modelId ? (normalizedTier ? 0 : 1) : normalizedTier ? 2 : 3;
     let group = groups.get(groupKey);
     if (!group) {
       group = { priority, modelId, tier, limits: new Map() };
@@ -185,4 +185,5 @@ export async function getProviderUsage(query: UsageQuery = {}): Promise<Provider
 
 export function clearProviderUsageCache(): void {
   usageCache = undefined;
+  usageInFlight = undefined;
 }
